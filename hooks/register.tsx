@@ -256,4 +256,8 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'Spinner' }, async ($, e, next) => {
-    if (!(await read($, isOn)) || e.props.message !== null) return next(e
+    if (!(await read($, isOn)) || e.props.message !== null) return next(e)
+    return next({ ...e, props: { ...e.props, word: 'Decoding the Matrix' } })
+  })
+
+}

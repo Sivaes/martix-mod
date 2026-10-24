@@ -1,0 +1,5 @@
+{
+  "name": "matrix-mod",
+  "owner": { "name": "Sivaes" },
+  "plugins": [{ "name": "matrix", "source": "./" }]
+}

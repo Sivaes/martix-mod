@@ -14,6 +14,37 @@ const C = {
 const PANE = 'matrix-rain'
 const isOn = atom({ plugin: 'matrix', key: 'isOn' } as const, true)
 const tick = atom({ plugin: 'matrix', key: 'tick' } as const, 0)
+const words = atom({ plugin: 'matrix', key: 'words' } as const, [] as string[], { shape: 'words-1' })
+const MAX_WORDS = 40
+
+const STOP = new Set(
+  ('that this with have from your what when will would could should there their about which them then than '
+  + 'just like into some more also been were they here want make sure okay yeah does done each very only '
+  + 'other over such well being need know think going because these those after before while where right '
+  + 'still really thing things doing using used through able again same something anything everything '
+  + 'show tell give help look find work please thanks good great cool word words okay sounds maybe getting '
+  + 'matrix online offline').split(' '),
+)
+
+function extract(text: string): string[] {
+  const found = text.replace(/```[\s\S]*?```/g, ' ').match(/[A-Za-z][A-Za-z0-9_.-]{3,18}/g) ?? []
+  const out: string[] = []
+  for (const w of found) {
+    const clean = w.replace(/[.-]+$/, '')
+    if (clean.length < 4 || STOP.has(clean.toLowerCase())) continue
+    out.push(clean.toUpperCase())
+  }
+  return out
+}
+
+function remember($: EngineInterface, text: string): Promise<unknown> {
+  const fresh = extract(text)
+  if (fresh.length === 0) return Promise.resolve()
+  return update($, words, list => {
+    const next = list.filter(w => !fresh.includes(w))
+    return [...next, ...fresh.slice(-12)].slice(-MAX_WORDS)
+  })
+}
 
 const GLYPHS = 'ｱｲｳｴｵｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃﾄﾅﾆﾇﾈﾉﾊﾋﾌﾍﾎﾏﾐﾑﾒﾓﾔﾕﾖﾗﾘﾙﾚﾛﾜﾝ0123456789Z:.=*+-<>'
 const TRAIL = 12
@@ -78,6 +109,24 @@ export const register: Register = on => {
     return { text: '> matrix: offline.' }
   })
 
+  on('prompt.submit', async ($, e, next) => {
+    if (!e.isMeta && !e.command) await remember($, e.text)
+    return next(e)
+  })
+
+  on('turn.complete', async ($, e, next) => {
+    if ('text' in e && typeof e.text === 'string') await remember($, e.text)
+    return next(e)
+  })
+
+  on('tool.call', async ($, e, next) => {
+    const input = e as unknown as { file_path?: unknown; path?: unknown }
+    const path = typeof input.file_path === 'string' ? input.file_path : typeof input.path === 'string' ? input.path : ''
+    const base = path.split(/[\\/]/).pop() ?? ''
+    await remember($, `${e.tool.startsWith('mcp__') ? '' : e.tool} ${base}`)
+    return next(e)
+  })
+
   on('prompt.compose', async ($, e, next) => {
     const result = await next(e)
     if (!(await read($, isOn))) return result
@@ -105,8 +154,10 @@ export const register: Register = on => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
     const t = await read($, tick)
-    const cols = Math.max(8, Math.min(60, Math.floor((e.viewport?.columns ?? 40) / 2)))
-    const rows = Math.max(8, Math.min(40, (e.viewport?.rows ?? 24) - 4))
+    const topics = await read($, words)
+    const width = e.props.bodyColumns ?? e.viewport?.columns ?? 40
+    const cols = Math.max(8, Math.min(60, Math.floor(width / 2)))
+    const rows = Math.max(8, Math.min(40, (e.viewport?.rows ?? 24) - 6))
 
     const lines = []
     for (let r = 0; r < rows; r++) {
@@ -114,13 +165,23 @@ export const register: Register = on => {
       for (let c = 0; c < cols; c++) {
         const speed = 1 + (hash(c, 1) % 3)
         const span = rows + TRAIL + (hash(c, 2) % rows)
-        const head = (Math.floor(t * speed / 2) + (hash(c, 3) % span)) % span
+        const pos = Math.floor((t * speed) / 2) + (hash(c, 3) % span)
+        const head = pos % span
+        const drop = Math.floor(pos / span)
+        // about half the drops carry a word from the conversation
+        const word = topics.length > 0 && hash(c, drop, 7) % 2 === 0 ? topics[hash(c, drop, 9) % topics.length] ?? '' : ''
+        const trail = Math.max(TRAIL, word.length)
         const d = head - r
         let color = C.void
         let ch = ' '
-        if (d >= 0 && d < TRAIL) {
-          color = d === 0 ? C.head : d < 3 ? C.phosphor : d < 7 ? C.deep : C.dim
-          ch = GLYPHS[hash(c, r, Math.floor(t / (d === 0 ? 1 : 4))) % GLYPHS.length] ?? '0'
+        if (d >= 0 && d < trail) {
+          if (d < word.length) {
+            ch = word[word.length - 1 - d] ?? ' '
+            color = d === 0 ? C.head : C.phosphor
+          } else {
+            color = d === 0 ? C.head : d < 3 ? C.phosphor : d < 7 ? C.deep : C.dim
+            ch = GLYPHS[hash(c, r, Math.floor(t / (d === 0 ? 1 : 4))) % GLYPHS.length] ?? '0'
+          }
         }
         const cell = ch + ' '
         const last = segs[segs.length - 1]
@@ -138,9 +199,16 @@ export const register: Register = on => {
       )
     }
 
+    const recent = topics.slice(-5).reverse().join(' · ')
     return (
       <Box flexDirection="column" backgroundColor={C.void} padding={1}>
         {lines}
+        <Box marginTop={1}>
+          <Text color={C.muted} wrap="truncate">
+            {'> tracing: '}
+            {recent || 'waiting for signal...'}
+          </Text>
+        </Box>
       </Box>
     )
   })

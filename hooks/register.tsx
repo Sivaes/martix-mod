@@ -1,6 +1,8 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
+import type { LogEntry } from '../types'
+
 // Claude Matrix design-system colors (Terminal theme)
 const C = {
   void: '#000000',
@@ -16,6 +18,15 @@ const isOn = atom({ plugin: 'matrix', key: 'isOn' } as const, true)
 const tick = atom({ plugin: 'matrix', key: 'tick' } as const, 0)
 const words = atom({ plugin: 'matrix', key: 'words' } as const, [] as string[], { shape: 'words-1' })
 const MAX_WORDS = 40
+const log = atom({ plugin: 'matrix', key: 'log' } as const, [] as LogEntry[], { shape: 'log-1' })
+const draft = atom({ plugin: 'matrix', key: 'draft' } as const, '')
+const isBusy = atom({ plugin: 'matrix', key: 'isBusy' } as const, false)
+
+function addLog($: EngineInterface, entry: LogEntry): Promise<unknown> {
+  const text = entry.text.trim()
+  if (!text) return Promise.resolve()
+  return update($, log, list => [...list, { ...entry, text }].slice(-30))
+}
 
 const STOP = new Set(
   ('that this with have from your what when will would could should there their about which them then than '
@@ -113,20 +124,40 @@ export const register: Register = on => {
   })
 
   on('prompt.submit', async ($, e, next) => {
-    if (!e.isMeta && !e.command) await remember($, e.text)
+    if (!e.isMeta && !e.command) {
+      try {
+        await remember($, e.text)
+        await addLog($, { who: 'you', text: e.text })
+        await update($, isBusy, () => true)
+      } catch {
+        // never block a prompt over the theme
+      }
+    }
     return next(e)
   })
 
   on('turn.complete', async ($, e, next) => {
-    if ('text' in e && typeof e.text === 'string') await remember($, e.text)
-    return next(e)
+    // subagent turns end here too; only the main loop talks to the terminal
+    if (e.agentId) return next(e)
+    const result = await next(e)
+    const answer = typeof e.answer === 'string' && e.answer ? e.answer : result.text
+    try {
+      if (answer) {
+        await remember($, answer)
+        await addLog($, { who: 'claude', text: answer })
+      }
+      await update($, isBusy, () => false)
+    } catch {
+      // theme state is best-effort
+    }
+    return result
   })
 
   on('tool.call', async ($, e, next) => {
     const input = e as unknown as { file_path?: unknown; path?: unknown }
     const path = typeof input.file_path === 'string' ? input.file_path : typeof input.path === 'string' ? input.path : ''
     const base = path.split(/[\\/]/).pop() ?? ''
-    await remember($, `${e.tool.startsWith('mcp__') ? '' : e.tool} ${base}`)
+    await remember($, `${e.tool.startsWith('mcp__') ? '' : e.tool} ${base}`).catch(() => undefined)
     return next(e)
   })
 
@@ -155,12 +186,19 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text } = $.ui.resolve(e)
+    const { Box, Text, Markdown } = $.ui.resolve(e)
     const t = await read($, tick)
     const topics = await read($, words)
-    const width = e.props.bodyColumns ?? e.viewport?.columns ?? 40
-    const cols = Math.max(8, Math.min(60, Math.floor(width / 2)))
-    const rows = Math.max(8, Math.min(40, (e.viewport?.rows ?? 24) - 6))
+    const rawLog = await read($, log)
+    const entries = Array.isArray(rawLog) ? rawLog : []
+    const busy = await read($, isBusy)
+    const rawDraft = await read($, draft)
+    const typed = typeof rawDraft === 'string' ? rawDraft : ''
+    const width = e.props.bodyColumns || e.viewport?.columns || 40
+    const totalRows = Math.max(16, (e.viewport?.rows ?? 30) - 4)
+    const cols = Math.max(8, Math.min(90, Math.floor(width / 2)))
+    // rain on top, terminal below; the bigger the pane, the more terminal
+    const rows = Math.max(6, Math.min(24, Math.floor(totalRows * 0.35)))
 
     const lines = []
     for (let r = 0; r < rows; r++) {
@@ -171,7 +209,6 @@ export const register: Register = on => {
         const pos = Math.floor((t * speed) / 2) + (hash(c, 3) % span)
         const head = pos % span
         const drop = Math.floor(pos / span)
-        // about half the drops carry a word from the conversation
         const word = topics.length > 0 && hash(c, drop, 7) % 2 === 0 ? topics[hash(c, drop, 9) % topics.length] ?? '' : ''
         const trail = Math.max(TRAIL, word.length)
         const d = head - r
@@ -203,15 +240,71 @@ export const register: Register = on => {
     }
 
     const recent = topics.slice(-5).reverse().join(' · ')
+    const shown = entries.slice(-6)
+    const cursor = Math.floor(t / 4) % 2 === 0 ? '█' : ' '
+
+    let inputEl = null
+    if (e.surface !== 'mobile') {
+      const { Input } = $.ui.resolve(e)
+      inputEl = (
+        <Box marginTop={1} borderStyle="single" borderColor={C.phosphor}>
+          <Input
+            key="matrix-input"
+            placeholder="> jack in... type a message and press Enter"
+            submitLabel="send"
+            value={typed}
+            autoFocus
+            onInput={(value: string) => void update($, draft, () => value)}
+            onSubmit={(value: string) => {
+              const text = value.trim()
+              if (!text) return
+              void (async () => {
+                await update($, draft, () => '')
+                await addLog($, { who: 'you', text })
+                await remember($, text)
+                await update($, isBusy, () => true)
+                await $.prompt.submit({ text, asUser: true })
+              })().catch(err => console.log('matrix: send', String(err)))
+            }}
+          />
+        </Box>
+      )
+    }
+
     return (
       <Box flexDirection="column" backgroundColor={C.void} padding={1}>
         {lines}
-        <Box marginTop={1}>
-          <Text color={C.muted} wrap="truncate">
-            {'> tracing: '}
-            {recent || 'waiting for signal...'}
-          </Text>
+        <Text color={C.muted} wrap="truncate">
+          {'> tracing: '}
+          {recent || 'waiting for signal...'}
+        </Text>
+        <Box flexDirection="column" marginTop={1} borderStyle="single" borderColor={C.deep} paddingX={1}>
+          {shown.length === 0 && <Text color={C.muted}>{'> terminal ready. type below to talk to Claude.'}</Text>}
+          {shown.map((m, i) =>
+            m.who === 'you' ? (
+              <Box key={`m${i}`} marginTop={i === 0 ? 0 : 1}>
+                <Text color={C.phosphor} bold>
+                  {'jaq@zion:~$ '}
+                </Text>
+                <Text color={C.head}>{m.text.length > 600 ? m.text.slice(0, 600) + '…' : m.text}</Text>
+              </Box>
+            ) : (
+              <Box key={`m${i}`} flexDirection="column" marginTop={i === 0 ? 0 : 1}>
+                <Text color={C.phosphor} bold>
+                  {'> claude://'}
+                </Text>
+                <Markdown text={m.text.length > 2400 ? m.text.slice(0, 2400) + '\n\n…' : m.text} />
+              </Box>
+            ),
+          )}
+          {busy && (
+            <Text color={C.phosphor}>
+              {'> decoding '}
+              {cursor}
+            </Text>
+          )}
         </Box>
+        {inputEl}
       </Box>
     )
   })
@@ -233,7 +326,7 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
-    if (!['composer', 'bridge', 'sdk'].includes(e.props.origin.kind) || !(await read($, isOn))) return next(e)
+    if (!['composer', 'bridge', 'sdk', 'plugin'].includes(e.props.origin.kind) || !(await read($, isOn))) return next(e)
     const { Box, Text } = $.ui.resolve(e)
     return (
       <Box backgroundColor={C.void} borderStyle="single" borderColor={C.dim} paddingX={1}>

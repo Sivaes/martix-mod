@@ -1,6 +1,6 @@
 {
   "name": "matrix",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Claude Matrix theme: digital-rain pane, green status band, terminal voice, /matrix toggle.",
   "types": "./types/index.d.ts",
   "author": {

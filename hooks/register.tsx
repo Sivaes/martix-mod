@@ -27,7 +27,10 @@ const STOP = new Set(
 )
 
 function extract(text: string): string[] {
-  const found = text.replace(/```[\s\S]*?```/g, ' ').match(/[A-Za-z][A-Za-z0-9_.-]{3,18}/g) ?? []
+  const found = text
+    .replace(/<([a-z-]+)[^>]*>[\s\S]*?<\/\1>/g, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/```[\s\S]*?```/g, ' ').match(/[A-Za-z][A-Za-z0-9_.-]{3,18}/g) ?? []
   const out: string[] = []
   for (const w of found) {
     const clean = w.replace(/[.-]+$/, '')
@@ -253,8 +256,4 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'Spinner' }, async ($, e, next) => {
-    if (!(await read($, isOn)) || e.props.message !== null) return next(e)
-    return next({ ...e, props: { ...e.props, word: 'Decoding the Matrix' } })
-  })
-
-}
+    if (!(await read($, isOn)) || e.props.message !== null) return next(e
